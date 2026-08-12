@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>naruto</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: black;
+        }
+
+        #v_src,
+        #out {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+
+        #out {
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        .darkness {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(10, 5, 0, 0.3);
+            mix-blend-mode: multiply;
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        .fx {
+            position: absolute;
+            height: auto;
+            top: 0;
+            left: 0;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            display: none;
+            mix-blend-mode: screen;
+            z-index: 20;
+        }
+
+        #n {
+            width: 1600px;
+        }
+
+        #s {
+            width: 2400px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <video id="v_src" autoplay playsinline></video>
+    <canvas id="out"></canvas>
+    <div class="darkness"></div>
+
+    <video id="n" class="fx" src="assets/naruto.mp4" muted autoplay loop playsinline></video>
+    <video id="s" class="fx" src="assets/sasuke.mp4" muted autoplay loop playsinline></video>
+
+    <script>
+        const vElement = document.getElementById('v_src');
+        const cElement = document.getElementById('out');
+        const ctx = cElement.getContext('2d');
+        const n = document.getElementById('n');
+        const s = document.getElementById('s');
+
+        // Kanvas bayangan untuk pemrosesan filter
+        const offscreenCanvas = document.createElement('canvas');
+        const oCtx = offscreenCanvas.getContext('2d');
+
+        // Status asli Naruto/Sasuke
+        let pwr = [0, 0];
+        let wasOpen = [false, false];
+
+        // Status portal & filter
+        let activeFilter = 0;
+        const TOTAL_FILTERS = 4;
+        let lastFilterSwitchTime = 0;
+        let isPinching = [false, false]; // Lacak status cubitan (pinch) untuk maksimal 2 tangan
+
+        // Warna tema khusus untuk kilauan kerangka tangan masing-masing filter
+        const GLOW_COLORS = [
+            { shadow: '#ff007f', line: '#ff55a3' }, // Comic: Merah Muda/Magenta
+            { shadow: '#ffffff', line: '#e0e0e0' }, // Halftone: Putih Elegan
+            { shadow: '#00f7ff', line: '#00d4ff' }, // Glitch: Neon Sian
+            { shadow: '#ffaa00', line: '#ffd000' }  // Thermal: Kuning Api
+        ];
+
+        function checkOpen(pts) {
+            let count = 0;
+            const wrist = pts[0];
+            const tips = [8, 12, 16, 20];
+            const pips = [6, 10, 14, 18];
+            for (let i = 0; i < tips.length; i++) {
+                const tip = pts[tips[i]];
+                const pip = pts[pips[i]];
+                if (Math.hypot(tip.x - wrist.x, tip.y - wrist.y) > Math.hypot(pip.x - wrist.x, pip.y - wrist.y)) count++;
+            }
+            return count >= 3;
+        }
+
+        function onResults(res) {
+            cElement.width = vElement.videoWidth;
+            cElement.height = vElement.videoHeight;
+            ctx.save();
+            ctx.clearRect(0, 0, cElement.width, cElement.height);
+
+            let fL = false;
+            let fR = false;
+
+            // Sembunyikan elemen overlay secara default, akan ditampilkan jika diperlukan
+            n.style.display = 'none';
+            s.style.display = 'none';
+
+            if (res.multiHandLandmarks && res.multiHandedness) {
+                const now = Date.now();
+
+                // 1. Deteksi Cubitan (Pinch) untuk mengganti filter
+                res.multiHandLandmarks.forEach((pts, i) => {
+                    const indexTip = pts[8];
+                    const thumbTip = pts[4];
+                    const dist = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y);
+
+                    if (dist < 0.04) {
+                        if (!isPinching[i] && (now - lastFilterSwitchTime > 800)) {
+                            activeFilter = (activeFilter + 1) % TOTAL_FILTERS;
+                            lastFilterSwitchTime = now;
+                            isPinching[i] = true;
+                        }
+                    } else if (dist > 0.06) {
+                        isPinching[i] = false;
+                    }
+                });
+
+                // Tentukan apakah mode portal aktif: 
+                // - Tepat 2 tangan terdeteksi
+                // - Kedua tangan tidak terbuka lebar (misal: mereka sedang membingkai portal)
+                let portalActive = false;
+                if (res.multiHandLandmarks.length === 2) {
+                    const open0 = checkOpen(res.multiHandLandmarks[0]);
+                    const open1 = checkOpen(res.multiHandLandmarks[1]);
+                    if (!open0 && !open1) {
+                        portalActive = true;
+                    }
+                }
+
+                if (portalActive) {
+                    // --- MODE FILTER PORTAL ---
+                    // Urutkan tangan dari kiri ke kanan berdasarkan koordinat x pergelangan tangan
+                    const sortedHands = res.multiHandLandmarks
+                        .map((hand, idx) => ({ hand, originalIndex: idx }))
+                        .sort((a, b) => a.hand[0].x - b.hand[0].x);
+
+                    // Tentukan sudut-sudut portal
+                    const p1 = { x: sortedHands[0].hand[8].x * cElement.width, y: sortedHands[0].hand[8].y * cElement.height }; // Telunjuk Kiri
+                    const p2 = { x: sortedHands[0].hand[4].x * cElement.width, y: sortedHands[0].hand[4].y * cElement.height }; // Jempol Kiri
+                    const p3 = { x: sortedHands[1].hand[4].x * cElement.width, y: sortedHands[1].hand[4].y * cElement.height }; // Jempol Kanan
+                    const p4 = { x: sortedHands[1].hand[8].x * cElement.width, y: sortedHands[1].hand[8].y * cElement.height }; // Telunjuk Kanan
+
+                    // Hitung kotak batas (bounding box) dari portal
+                    const minX = Math.floor(Math.min(p1.x, p2.x, p3.x, p4.x));
+                    const minY = Math.floor(Math.min(p1.y, p2.y, p3.y, p4.y));
+                    const maxX = Math.ceil(Math.max(p1.x, p2.x, p3.x, p4.x));
+                    const maxY = Math.ceil(Math.max(p1.y, p2.y, p3.y, p4.y));
+                    const w = maxX - minX;
+                    const h = maxY - minY;
+
+                    if (w > 0 && h > 0) {
+                        // Siapkan ukuran kanvas bayangan
+                        offscreenCanvas.width = w;
+                        offscreenCanvas.height = h;
+
+                        // Gambar bagian video yang dipotong ke kanvas bayangan
+                        oCtx.drawImage(vElement, minX, minY, w, h, 0, 0, w, h);
+
+                        // Terapkan filter yang aktif
+                        const imgData = oCtx.getImageData(0, 0, w, h);
+                        const data = imgData.data;
+
+                        if (activeFilter === 0) {
+                            // --- FILTER POP-ART KOMIK (Oranye, Merah Muda, Hitam) ---
+                            for (let i = 0; i < data.length; i += 4) {
+                                const r = data[i];
+                                const g = data[i + 1];
+                                const b = data[i + 2];
+                                const v = 0.299 * r + 0.587 * g + 0.114 * b; // Kecerahan
+
+                                if (v < 85) {
+                                    // Ungu Tua / Hitam
+                                    data[i] = 20;
+                                    data[i + 1] = 5;
+                                    data[i + 2] = 35;
+                                } else if (v < 170) {
+                                    // Merah Muda Neon
+                                    data[i] = 255;
+                                    data[i + 1] = 0;
+                                    data[i + 2] = 128;
+                                } else {
+                                    // Oranye Cerah
+                                    data[i] = 255;
+                                    data[i + 1] = 120;
+                                    data[i + 2] = 0;
+                                }
+                            }
+                            oCtx.putImageData(imgData, 0, 0);
+
+                        } else if (activeFilter === 1) {
+                            // --- FILTER MATRIKS TITIK HALFTONE ---
+                            const brightness = [];
+                            for (let i = 0; i < data.length; i += 4) {
+                                brightness.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+                            }
+
+                            // Isi kanvas dengan latar belakang putih
+                            oCtx.fillStyle = '#ffffff';
+                            oCtx.fillRect(0, 0, w, h);
+
+                            // Gambar titik-titik hitam berdasarkan tingkat kecerahan
+                            oCtx.fillStyle = '#000000';
+                            const grid = 8;
+                            for (let cy = 0; cy < h; cy += grid) {
+                                for (let cx = 0; cx < w; cx += grid) {
+                                    const sampleIdx = Math.floor(cy + grid / 2) * w + Math.floor(cx + grid / 2);
+                                    if (sampleIdx < brightness.length) {
+                                        const bVal = brightness[sampleIdx];
+                                        const radius = (1 - bVal / 255) * (grid / 2) * 1.3;
+                                        if (radius > 0.5) {
+                                            oCtx.beginPath();
+                                            oCtx.arc(cx + grid / 2, cy + grid / 2, radius, 0, Math.PI * 2);
+                                            oCtx.fill();
+                                        }
+                                    }
+                                }
+                            }
+
+                        } else if (activeFilter === 2) {
+                            // --- FILTER RGB GLITCH / PERGESERAN DENGAN SCANLINES ---
+                            oCtx.putImageData(imgData, 0, 0);
+
+                            // Tambahkan lapisan pergeseran aberasi kromatik
+                            oCtx.save();
+                            oCtx.globalAlpha = 0.4;
+                            oCtx.globalCompositeOperation = 'screen';
+
+                            // Pergeseran Sian
+                            oCtx.fillStyle = 'rgba(0, 255, 255, 0.15)';
+                            oCtx.fillRect(0, 0, w, h);
+                            oCtx.drawImage(vElement, minX + 6, minY, w, h, 0, 0, w, h);
+
+                            // Pergeseran Merah
+                            oCtx.fillStyle = 'rgba(255, 0, 0, 0.15)';
+                            oCtx.fillRect(0, 0, w, h);
+                            oCtx.drawImage(vElement, minX - 6, minY, w, h, 0, 0, w, h);
+                            oCtx.restore();
+
+                            // Hamparan Scanlines (Garis Pemindai)
+                            oCtx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
+                            oCtx.lineWidth = 1.5;
+                            for (let sy = 0; sy < h; sy += 4) {
+                                oCtx.beginPath();
+                                oCtx.moveTo(0, sy);
+                                oCtx.lineTo(w, sy);
+                                oCtx.stroke();
+                            }
+
+                        } else if (activeFilter === 3) {
+                            // --- FILTER THERMAL HEATMAP (PETA PANAS) ---
+                            for (let i = 0; i < data.length; i += 4) {
+                                const r = data[i];
+                                const g = data[i + 1];
+                                const b = data[i + 2];
+                                const v = 0.299 * r + 0.587 * g + 0.114 * b; // Kecerahan
+
+                                if (v < 50) {
+                                    // Dingin: Biru tua/ungu
+                                    data[i] = v * 2;
+                                    data[i + 1] = 0;
+                                    data[i + 2] = 100 + v * 3;
+                                } else if (v < 130) {
+                                    // Sedang-dingin: Sian/Hijau
+                                    data[i] = 0;
+                                    data[i + 1] = 80 + (v - 50) * 2;
+                                    data[i + 2] = 255 - (v - 50) * 2;
+                                } else if (v < 200) {
+                                    // Hangat: Kuning/Oranye
+                                    data[i] = 150 + (v - 130) * 1.5;
+                                    data[i + 1] = 200 + (v - 130) * 0.7;
+                                    data[i + 2] = 0;
+                                } else {
+                                    // Panas: Merah/Putih
+                                    data[i] = 255;
+                                    data[i + 1] = (v - 200) * 4.5;
+                                    data[i + 2] = (v - 200) * 4.5;
+                                }
+                            }
+                            oCtx.putImageData(imgData, 0, 0);
+                        }
+
+                        // Render ke kanvas utama di dalam area portal yang dipotong (clipped)
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.lineTo(p3.x, p3.y);
+                        ctx.lineTo(p4.x, p4.y);
+                        ctx.closePath();
+                        ctx.clip();
+                        ctx.drawImage(offscreenCanvas, minX, minY);
+                        ctx.restore();
+
+                        // Gambar bingkai/garis batas portal yang berkilau
+                        ctx.save();
+                        ctx.strokeStyle = GLOW_COLORS[activeFilter].line;
+                        ctx.lineWidth = 4;
+                        ctx.shadowBlur = 15;
+                        ctx.shadowColor = GLOW_COLORS[activeFilter].shadow;
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.lineTo(p3.x, p3.y);
+                        ctx.lineTo(p4.x, p4.y);
+                        ctx.closePath();
+                        ctx.stroke();
+                        ctx.restore();
+                    }
+
+                    // Gambar Kerangka Tangan (Hanya penghubung/garis, TANPA titik sendi untuk mode portal)
+                    res.multiHandLandmarks.forEach((pts) => {
+                        ctx.save();
+                        ctx.shadowBlur = 12;
+                        ctx.shadowColor = GLOW_COLORS[activeFilter].shadow;
+                        drawConnectors(ctx, pts, HAND_CONNECTIONS, { color: GLOW_COLORS[activeFilter].line, lineWidth: 3.5 });
+                        ctx.restore();
+                    });
+
+                } else {
+                    // --- MODE GESTUR & OVERLAY NARUTO / SASUKE ASLI ---
+                    res.multiHandLandmarks.forEach((pts, i) => {
+                        const label = res.multiHandedness[i].label;
+                        const isR = label === 'Right';
+                        const idx = isR ? 1 : 0;
+
+                        // Gambar kerangka biru terang asli DENGAN titik sendi putih
+                        ctx.save();
+                        ctx.shadowBlur = 10;
+                        ctx.shadowColor = '#00fbff';
+                        drawConnectors(ctx, pts, HAND_CONNECTIONS, { color: '#00d4ff', lineWidth: 3 });
+                        drawLandmarks(ctx, pts, { color: '#ffffff', lineWidth: 1, radius: 2 });
+                        ctx.restore();
+
+                        // Pemeriksaan kekuatan (power-up) asli
+                        const open = checkOpen(pts);
+                        pwr[idx] += open ? 0.05 : -0.15;
+                        pwr[idx] = Math.max(0, Math.min(1, pwr[idx]));
+
+                        if (open && !wasOpen[idx]) {
+                            const vid = isR ? s : n;
+                            vid.currentTime = 0;
+                            vid.play();
+                        }
+                        wasOpen[idx] = open;
+
+                        const wrist = pts[0];
+                        const knk = pts[9];
+
+                        if (pwr[idx] > 0.01) {
+                            if (isR) {
+                                fR = true;
+                                const tx = (wrist.x + knk.x) / 2;
+                                const ty = (wrist.y + knk.y) / 2;
+                                s.style.left = `${(1 - tx) * window.innerWidth}px`;
+                                s.style.top = `${ty * window.innerHeight}px`;
+                                s.style.display = 'block';
+                                s.style.opacity = pwr[idx];
+                            } else {
+                                fL = true;
+                                const dx = knk.x - wrist.x;
+                                const dy = knk.y - wrist.y;
+                                const tx = knk.x + (dx * 0.8);
+                                const ty = knk.y + (dy * 0.8);
+                                n.style.left = `${(1 - tx) * window.innerWidth}px`;
+                                n.style.top = `${(ty * window.innerHeight) - 120}px`;
+                                n.style.display = 'block';
+                                n.style.opacity = pwr[idx];
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Bersihkan opasitas bola energi jika tangan hilang atau tertutup
+            if (!fL) {
+                pwr[0] = Math.max(0, pwr[0] - 0.15);
+                if (pwr[0] > 0.01) { n.style.display = 'block'; n.style.opacity = pwr[0]; }
+                wasOpen[0] = false;
+            }
+            if (!fR) {
+                pwr[1] = Math.max(0, pwr[1] - 0.15);
+                if (pwr[1] > 0.01) { s.style.display = 'block'; s.style.opacity = pwr[1]; }
+                wasOpen[1] = false;
+            }
+
+            ctx.restore();
+        }
+
+        const h = new Hands({
+            locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+        });
+
+        h.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.65,
+            minTrackingConfidence: 0.65
+        });
+
+        h.onResults(onResults);
+
+        const cam = new Camera(vElement, {
+            onFrame: async () => { await h.send({ image: vElement }); },
+            width: 1280, height: 720
+        });
+        cam.start();
+    </script>
+</body>
+
+</html>
